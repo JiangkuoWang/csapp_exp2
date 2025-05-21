@@ -1,7 +1,7 @@
 /* 
  * tsh - A tiny shell program with job control
  * 
- * <Put your name and login ID here>
+ * ID: 220110927 NAME: Jiangkuo Wang
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -166,6 +166,73 @@ int main(int argc, char **argv)
 */
 void eval(char *cmdline) 
 {
+    char *argv[MAXARGS];    /* Argument list execve() */
+    char buf[MAXLINE];      /* Holds modified command line */
+    int bg;                 /* Should the job run in bg or fg? */
+    pid_t pid;              /* Process id */
+    sigset_t mask_one, prev_mask; /* Signal masks */
+
+    strcpy(buf, cmdline);
+    bg = parseline(buf, argv); 
+
+    if (argv[0] == NULL)
+        return;   /* Ignore empty lines */
+
+    if (builtin_cmd(argv)) {
+        return; /* Command was a built-in */
+    }
+
+    /* Initialize signal set for SIGCHLD */
+    sigemptyset(&mask_one);
+    sigaddset(&mask_one, SIGCHLD);
+
+    /* Block SIGCHLD */
+    if (sigprocmask(SIG_BLOCK, &mask_one, &prev_mask) < 0) {
+        unix_error("eval: sigprocmask block error");
+        return;
+    }
+
+    if ((pid = Fork()) == 0) {   /* Child runs user job */
+        /* Unblock SIGCHLD in child */
+        if (sigprocmask(SIG_SETMASK, &prev_mask, NULL) < 0) {
+            unix_error("eval: child sigprocmask_restore error");
+            exit(1); /* Exit if cannot restore mask */
+        }
+
+        /* Create a new process group for the child */
+        if (setpgid(0, 0) < 0) {
+            unix_error("eval: setpgid error");
+            exit(1); /* Exit if cannot set new process group */
+        }
+
+        if (execve(argv[0], argv, environ) < 0) {
+            printf("%s: Command not found\n", argv[0]);
+            exit(0); /* Exit with 0 as per lab guide's screenshot */
+        }
+    }
+
+    /* Parent process */
+    int state = bg ? BG : FG;
+    if (!addjob(jobs, pid, state, cmdline)) {
+        /* If addjob fails (e.g., too many jobs), an error is already printed by addjob. */
+        /* The job won't be tracked, which is a limitation. */
+    }
+
+    /* Unblock SIGCHLD in parent */
+    if (sigprocmask(SIG_SETMASK, &prev_mask, NULL) < 0) {
+        unix_error("eval: parent sigprocmask_restore error");
+    }
+
+    if (!bg) { 
+        waitfg(pid);
+    } else {
+        struct job_t *job = getjobpid(jobs, pid);
+        if (job) { 
+            printf("[%d] (%d) %s", job->jid, job->pid, job->cmdline);
+        } else {
+            printf("Error: Could not retrieve job info for background process %d\\n", pid);
+        }
+    }
     return;
 }
 
@@ -232,7 +299,25 @@ int parseline(const char *cmdline, char **argv)
  */
 int builtin_cmd(char **argv) 
 {
-    return 0;     /* not a builtin command */
+    if (argv[0] == NULL) { /* Should not happen if called from eval after check */
+        return 0;
+    }
+
+    if (strcmp(argv[0], "quit") == 0) {
+        exit(0);
+    }
+    else if (strcmp(argv[0], "jobs") == 0) {
+        listjobs(jobs); /* listjobs is a provided helper function */
+        return 1;
+    }
+    else if (strcmp(argv[0], "bg") == 0 || strcmp(argv[0], "fg") == 0) {
+        do_bgfg(argv); /* do_bgfg will handle bg/fg logic */
+        return 1;
+    }
+    /* You can add more built-in commands here if needed */
+    /* Example: "&" is handled by parseline, not a builtin_cmd itself */
+
+    return 0;     /* Not a builtin command */
 }
 
 /* 
@@ -240,6 +325,62 @@ int builtin_cmd(char **argv)
  */
 void do_bgfg(char **argv) 
 {
+    char *id_str;        /* String for PID or JID */
+    struct job_t *job;   /* Pointer to the job struct */
+    int jid;
+    pid_t pid;
+
+    if (argv[1] == NULL) {
+        printf("%s command requires PID or %%jobid argument\n", argv[0]);
+        return;
+    }
+
+    id_str = argv[1];
+
+    if (id_str[0] == '%') { /* JID argument */
+        jid = atoi(&id_str[1]);
+        if (jid == 0) { /* atoi returns 0 for non-numeric or '%0' */
+            printf("%s: argument must be a PID or %%jobid\n", argv[0]);
+            return;
+        }
+        job = getjobjid(jobs, jid);
+        if (job == NULL) {
+            printf("%s: No such job\n", id_str);
+            return;
+        }
+    } else if (isdigit(id_str[0])) { /* PID argument */
+        pid = atoi(id_str);
+        if (pid == 0) { /* atoi returns 0 for non-numeric */
+            printf("%s: argument must be a PID or %%jobid\n", argv[0]);
+            return;
+        }
+        job = getjobpid(jobs, pid);
+        if (job == NULL) {
+            printf("(%d): No such process\n", pid);
+            return;
+        }
+    } else {
+        printf("%s: argument must be a PID or %%jobid\n", argv[0]);
+        return;
+    }
+
+    /* At this point, 'job' points to a valid job struct */
+
+    if (kill(-(job->pid), SIGCONT) < 0) {
+        unix_error("do_bgfg: kill(SIGCONT) error");
+        /* SIGCONT error might not be fatal for the shell, but report it */
+        /* The job state might not change if kill fails. */
+    }
+
+    if (strcmp(argv[0], "bg") == 0) {
+        job->state = BG;
+        printf("[%d] (%d) %s", job->jid, job->pid, job->cmdline);
+        /* cmdline includes newline, this is consistent with tshref */
+    } else { /* fg command */
+        job->state = FG;
+        waitfg(job->pid); /* Wait for the foreground job to complete or change state */
+    }
+
     return;
 }
 
@@ -248,6 +389,39 @@ void do_bgfg(char **argv)
  */
 void waitfg(pid_t pid)
 {
+    if (pid == 0) { /* No process to wait for, or invalid PID */
+        return;
+    }
+
+    struct job_t *job = getjobpid(jobs, pid);
+
+    /* Check if the job exists and is the foreground job we are interested in */
+    /* It might have been reaped by sigchld_handler if it terminated very quickly, */
+    /* or its state might have changed (e.g. stopped). */
+    if (job == NULL || job->pid != pid) { 
+        /* Job doesn't exist or PID mismatch (should not happen if pid comes from a valid fg job) */
+        return; 
+    }
+
+    /* Loop while the job is still the foreground job and its PID matches */
+    /* The state check (job->state == FG) is crucial. */
+    /* The pid check (job->pid == pid) ensures we are monitoring the same job, 
+       as job structs might be reused if a job is deleted and another added. */
+    while (job->state == FG && job->pid == pid) {
+        /* Use sigsuspend for a clean wait, as recommended by CSAPP text. */
+        /* sleep() is simpler but less robust. The lab guide mentions sleep(1) is okay. */
+        /* Let's use sleep(1) as per the guide's allowance for simplicity. */
+        /* If using sigsuspend: */
+        /* sigset_t mask, prev_mask; */
+        /* sigemptyset(&mask); // Empty mask, allows all signals not otherwise blocked */
+        /* sigsuspend(&mask); // Atomically unblocks signals and waits for one */
+        
+        sleep(1); /* Check status roughly every second. */
+                 /* In a real shell, sigsuspend would be better here to react immediately to SIGCHLD. */
+                 /* When SIGCHLD arrives, its handler will update the job's state or remove it. */
+                 /* Then this loop will see the change and terminate. */
+    }
+
     return;
 }
 
@@ -264,6 +438,74 @@ void waitfg(pid_t pid)
  */
 void sigchld_handler(int sig) 
 {
+    int olderrno = errno; /* Save errno, as waitpid can change it */
+    pid_t pid;
+    int status;
+    struct job_t *job;
+
+    /* Reap all available zombie children and handle stopped children */
+    /* WNOHANG: return immediately if no child has exited. */
+    /* WUNTRACED: also return if a child has stopped (and not just terminated). */
+    while ((pid = waitpid(-1, &status, WNOHANG | WUNTRACED)) > 0) {
+        job = getjobpid(jobs, pid);
+        if (job == NULL) {
+            /* This should ideally not happen if all children are launched via addjob */
+            /* Could be a child not managed by this shell, or an error */
+            if (verbose) {
+                printf("sigchld_handler: Job not found for PID %d\n", pid);
+            }
+            // Sio_error might be too strong here if it exits, use Sio_printf for verbose logging.
+            // Let's just continue if job not found, as it might be an external process forked by the job.
+            // However, all direct children of the shell should be in the jobs list.
+            continue; 
+        }
+
+        if (WIFEXITED(status)) { /* Child terminated normally */
+            if (verbose) {
+                // Using Sio_printf for async-signal-safety if available from csapp.h
+                // sprintf(sbuf, "sigchld_handler: Job [%d] (%d) terminated normally with status %d\n", 
+                //         job->jid, pid, WEXITSTATUS(status));
+                // Sio_puts(sbuf);
+            }
+            deletejob(jobs, pid);
+        } else if (WIFSIGNALED(status)) { /* Child terminated by a signal */
+            // Use Sio_ कह safe functions for printing from signal handler
+            // We need to compose the message carefully. Standard printf is not safe.
+            // The lab guide implies printf might be used, but strictly, it's not safe.
+            // Let's compose a message and print it outside if possible, or use Sio if available.
+            // For this lab, often simplified signal handling is accepted.
+            // The trace files will show what tshref prints.
+            // Example: Job [1] (12345) terminated by signal 2 (SIGINT)
+            // Let's use a safe way to print, like Sio_psignal if csapp provides it, or construct manually. 
+            // The problem description does not strictly enforce async-signal safety for printf, 
+            // especially as other parts of shell code use printf.
+            // Let's try to build the message as required by traces.
+            
+            // The csapp.h provides Sio_puts, Sio_error. Let's use Sio_puts with sprintf to sbuf (global).
+            // This is a common pattern in CS:APP examples.
+            sprintf(sbuf, "Job [%d] (%d) terminated by signal %d\n", 
+                    job->jid, pid, WTERMSIG(status));
+            Sio_puts(sbuf); // Sio_puts is async-signal-safe
+            deletejob(jobs, pid);
+
+        } else if (WIFSTOPPED(status)) { /* Child stopped by a signal */
+            job->state = ST;
+            sprintf(sbuf, "Job [%d] (%d) stopped by signal %d\n", 
+                    job->jid, pid, WSTOPSIG(status));
+            Sio_puts(sbuf); // Sio_puts is async-signal-safe
+        }
+        /* Else: other status changes (WIFCONTINUED) are not explicitly handled by tsh basic requirements */
+    }
+
+    /* Check for other errors from waitpid, but not ECHILD (no more children) */
+    if (pid < 0 && errno != ECHILD && errno != EINTR) {
+        // unix_error("sigchld_handler: waitpid error"); // unix_error exits, too strong for handler
+        // Let's use Sio_error which also uses Sio_puts and sets exit_status
+        sprintf(sbuf, "sigchld_handler: waitpid error: %s\n", strerror(errno));
+        Sio_puts(sbuf); // Report error but don't exit the shell from handler
+    }
+
+    errno = olderrno; /* Restore errno */
     return;
 }
 
@@ -274,6 +516,24 @@ void sigchld_handler(int sig)
  */
 void sigint_handler(int sig) 
 {
+    int olderrno = errno; /* Save errno */
+    pid_t pid = fgpid(jobs); /* Get PID of the foreground job */
+
+    if (pid != 0) { /* If there is a foreground job */
+        if (kill(-pid, SIGINT) < 0) { /* Send SIGINT to the entire foreground process group */
+            // unix_error("sigint_handler: kill error"); // unix_error exits, too strong for handler
+            // Use Sio_puts for error reporting from handler
+            sprintf(sbuf, "sigint_handler: kill(SIGINT) error for PID %d: %s\n", 
+                    pid, strerror(errno));
+            Sio_puts(sbuf);
+        }
+    }
+    // If there's no foreground job, SIGINT should typically be ignored by the shell itself,
+    // or it might terminate the shell if that's the desired behavior (but not for tsh).
+    // The default action for SIGINT for the shell process itself is often to terminate.
+    // However, the main loop of tsh is robust. This handler ensures only fg job gets it.
+
+    errno = olderrno; /* Restore errno */
     return;
 }
 
@@ -284,6 +544,23 @@ void sigint_handler(int sig)
  */
 void sigtstp_handler(int sig) 
 {
+    int olderrno = errno; /* Save errno */
+    pid_t pid = fgpid(jobs); /* Get PID of the foreground job */
+
+    if (pid != 0) { /* If there is a foreground job */
+        if (kill(-pid, SIGTSTP) < 0) { /* Send SIGTSTP to the entire foreground process group */
+            // unix_error("sigtstp_handler: kill error"); // unix_error exits, too strong for handler
+            // Use Sio_puts for error reporting from handler
+            sprintf(sbuf, "sigtstp_handler: kill(SIGTSTP) error for PID %d: %s\n", 
+                    pid, strerror(errno));
+            Sio_puts(sbuf);
+        }
+    }
+    // If there's no foreground job, SIGTSTP should be ignored by the shell itself.
+    // This handler ensures only the fg job gets it.
+    // The sigchld_handler will then be responsible for updating the job's state to ST (Stopped).
+
+    errno = olderrno; /* Restore errno */
     return;
 }
 
